@@ -1,8 +1,10 @@
 //! Czech QR payment (SPAYD/SPD) string and QR image generator.
 //!
 //! The crate builds deterministic SPAYD ("Short Payment Descriptor") strings for
-//! Czech QR payments and renders them as PNG or SVG QR codes. All processing
-//! happens offline; the crate performs no network access.
+//! Czech QR payments and renders them as PNG or SVG QR codes. It also builds
+//! EPC069-12 (SEPA) payloads, validates complete SPD strings, and generates one
+//! QR image per CSV row in batch mode. All processing happens offline; the crate
+//! performs no network access.
 //!
 //! # Example
 //!
@@ -18,6 +20,8 @@
 //!     "SPD*1.0*ACC:CZ6508000000192000145399*AM:1250.00*CC:CZK*MSG:Faktura 2026-001*X-VS:1234567890"
 //! );
 //! ```
+
+pub mod batch;
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -36,6 +40,18 @@ pub const QUIET_ZONE: u32 = 4;
 
 /// Maximum message length in characters after ASCII folding.
 pub const MAX_MESSAGE_CHARS: usize = 60;
+
+/// Maximum beneficiary name length in an EPC069-12 payload, in characters.
+pub const MAX_EPC_BENEFICIARY_CHARS: usize = 70;
+
+/// Maximum remittance length in an EPC069-12 payload, in characters.
+pub const MAX_EPC_REMITTANCE_CHARS: usize = 140;
+
+/// Maximum information length in an EPC069-12 payload, in characters.
+pub const MAX_EPC_INFORMATION_CHARS: usize = 70;
+
+/// Maximum EPC amount in minor units, `999999999.99` EUR.
+pub const MAX_EPC_AMOUNT_MINOR: i64 = 99_999_999_999;
 
 /// A single Czech QR payment.
 ///
@@ -169,55 +185,248 @@ impl Payment {
 
     /// Renders the payment as a PNG QR code with `scale` pixels per module.
     pub fn to_qr_png(&self, scale: u32) -> Result<Vec<u8>, Error> {
-        let code = self.encode_qr()?;
-        let modules = code.width() as u32;
-        let side = pixel_side(modules, scale)?;
-        let mut image = image::GrayImage::from_pixel(side, side, Luma([255u8]));
-        for (index, color) in code.to_colors().iter().enumerate() {
-            if *color == ModuleColor::Dark {
-                let index = index as u32;
-                let x = (QUIET_ZONE + index % modules) * scale;
-                let y = (QUIET_ZONE + index / modules) * scale;
-                for pixel_y in y..y + scale {
-                    for pixel_x in x..x + scale {
-                        image.put_pixel(pixel_x, pixel_y, Luma([0u8]));
-                    }
-                }
-            }
-        }
-        let mut bytes = Vec::new();
-        PngEncoder::new(&mut bytes)
-            .write_image(image.as_raw(), side, side, ExtendedColorType::L8)
-            .map_err(|error| Error::PngEncoding {
-                message: error.to_string(),
-            })?;
-        Ok(bytes)
+        let spd = self.to_spd()?;
+        encode_qr_png(spd.as_bytes(), scale)
     }
 
     /// Renders the payment as an SVG QR code with `scale` pixels per module.
     pub fn to_qr_svg(&self, scale: u32) -> Result<String, Error> {
-        let code = self.encode_qr()?;
-        let modules = code.width() as u32;
-        let side = pixel_side(modules, scale)?;
-        let total = modules + 2 * QUIET_ZONE;
-        let mut path = String::new();
-        for (index, color) in code.to_colors().iter().enumerate() {
-            if *color == ModuleColor::Dark {
-                let index = index as u32;
-                let x = QUIET_ZONE + index % modules;
-                let y = QUIET_ZONE + index / modules;
-                let _ = write!(path, "M{x} {y}h1v1h-1z");
-            }
-        }
-        Ok(format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{side}\" viewBox=\"0 0 {total} {total}\" shape-rendering=\"crispEdges\"><rect width=\"100%\" height=\"100%\" fill=\"#FFFFFF\"/><path d=\"{path}\" fill=\"#000000\"/></svg>"
-        ))
+        let spd = self.to_spd()?;
+        encode_qr_svg(spd.as_bytes(), scale)
     }
 
-    fn encode_qr(&self) -> Result<QrCode, Error> {
-        let spd = self.to_spd()?;
-        encode_byte_mode(spd.as_bytes())
+    /// Returns a normalized human readable summary of the payment fields.
+    ///
+    /// Each field appears on its own line. Empty optional fields are omitted.
+    /// The amount is printed in major units with two decimal places.
+    pub fn summary(&self) -> Result<String, Error> {
+        let amount = format_amount(self.amount_minor)?;
+        let currency = normalize_currency(&self.currency)?;
+        let mut lines = vec![
+            format!("IBAN: {}", normalize_iban(&self.iban)?),
+            format!("Amount: {amount} {currency}"),
+        ];
+        if let Some(due_date) = non_empty(self.due_date.as_deref()) {
+            format_due_date(due_date)?;
+            lines.push(format!("Due date: {due_date}"));
+        }
+        if let Some(message) = non_empty(self.message.as_deref()) {
+            lines.push(format!("Message: {message}"));
+        }
+        let symbols = [
+            ("Variable symbol", self.variable_symbol.as_deref()),
+            ("Constant symbol", self.constant_symbol.as_deref()),
+            ("Specific symbol", self.specific_symbol.as_deref()),
+        ];
+        for (label, symbol) in symbols {
+            if let Some(symbol) = non_empty(symbol) {
+                lines.push(format!("{label}: {symbol}"));
+            }
+        }
+        Ok(lines.join("\n"))
     }
+}
+
+/// Builder for an EPC069-12 (SEPA) credit transfer payload.
+///
+/// The payload is Euro only and uses the UTF-8 character set. The beneficiary
+/// name is required. The BIC and the unstructured information line are
+/// optional. The payment message is used as the unstructured remittance line.
+///
+/// # Example
+///
+/// ```
+/// use qrplatba::{EpcPayment, Payment};
+///
+/// let payment = Payment::new("CZ6508000000192000145399", 125_000)
+///     .with_currency("EUR")
+///     .with_message("Faktura 2026-001");
+/// let payload = EpcPayment::new(&payment, "Firma s.r.o.")
+///     .with_information("Objednavka 42")
+///     .to_payload()
+///     .unwrap();
+/// assert!(payload.starts_with("BCD\n002\n1\nSCT\n"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct EpcPayment<'a> {
+    payment: &'a Payment,
+    beneficiary: String,
+    bic: Option<String>,
+    information: Option<String>,
+}
+
+impl<'a> EpcPayment<'a> {
+    /// Creates an EPC payload builder for `payment` payable to `beneficiary`.
+    pub fn new(payment: &'a Payment, beneficiary: impl Into<String>) -> Self {
+        Self {
+            payment,
+            beneficiary: beneficiary.into(),
+            bic: None,
+            information: None,
+        }
+    }
+
+    /// Sets the optional BIC of the beneficiary bank, 8 or 11 characters.
+    pub fn with_bic(mut self, bic: impl Into<String>) -> Self {
+        self.bic = Some(bic.into());
+        self
+    }
+
+    /// Sets the optional unstructured information line.
+    pub fn with_information(mut self, information: impl Into<String>) -> Self {
+        self.information = Some(information.into());
+        self
+    }
+
+    /// Builds the EPC069-12 payload with lines separated by `\n`.
+    ///
+    /// The payload rejects currencies other than EUR, amounts outside the range
+    /// 0.01 to 999999999.99, text over the specification limits, and control
+    /// characters.
+    pub fn to_payload(&self) -> Result<String, Error> {
+        let currency = normalize_currency(&self.payment.currency)?;
+        if currency != "EUR" {
+            return Err(Error::UnsupportedEpcCurrency { input: currency });
+        }
+        if self.payment.amount_minor > MAX_EPC_AMOUNT_MINOR {
+            return Err(Error::EpcAmountOutOfRange {
+                amount_minor: self.payment.amount_minor,
+            });
+        }
+        let iban = normalize_iban(&self.payment.iban)?;
+        let amount = format_amount(self.payment.amount_minor)?;
+        let beneficiary = validate_epc_text(
+            "beneficiary name",
+            &self.beneficiary,
+            MAX_EPC_BENEFICIARY_CHARS,
+        )?;
+        let mut lines = vec![
+            "BCD".to_string(),
+            "002".to_string(),
+            "1".to_string(),
+            "SCT".to_string(),
+        ];
+        if let Some(bic) = self.bic.as_deref().filter(|value| !value.trim().is_empty()) {
+            lines.push(normalize_bic(bic)?);
+        }
+        lines.push(beneficiary);
+        lines.push(iban);
+        lines.push(format!("EUR{amount}"));
+        if let Some(message) = non_empty(self.payment.message.as_deref()) {
+            lines.push(validate_epc_text(
+                "remittance",
+                message,
+                MAX_EPC_REMITTANCE_CHARS,
+            )?);
+        }
+        if let Some(information) = non_empty(self.information.as_deref()) {
+            lines.push(validate_epc_text(
+                "information",
+                information,
+                MAX_EPC_INFORMATION_CHARS,
+            )?);
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// Renders the EPC payload as a PNG QR code with `scale` pixels per module.
+    pub fn to_qr_png(&self, scale: u32) -> Result<Vec<u8>, Error> {
+        let payload = self.to_payload()?;
+        encode_qr_png(payload.as_bytes(), scale)
+    }
+
+    /// Renders the EPC payload as an SVG QR code with `scale` pixels per module.
+    pub fn to_qr_svg(&self, scale: u32) -> Result<String, Error> {
+        let payload = self.to_payload()?;
+        encode_qr_svg(payload.as_bytes(), scale)
+    }
+}
+
+/// Builds an EPC069-12 payload for `payment` payable to `beneficiary`.
+///
+/// This is a shortcut for [`EpcPayment::new`] followed by
+/// [`EpcPayment::to_payload`].
+pub fn epc_string(payment: &Payment, beneficiary: &str) -> Result<String, Error> {
+    EpcPayment::new(payment, beneficiary).to_payload()
+}
+
+fn validate_epc_text(name: &'static str, input: &str, max_length: usize) -> Result<String, Error> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(Error::EpcTextEmpty { name });
+    }
+    if let Some(character) = trimmed.chars().find(|character| character.is_control()) {
+        return Err(Error::ControlCharacter { character });
+    }
+    let length = trimmed.chars().count();
+    if length > max_length {
+        return Err(Error::EpcTextTooLong {
+            name,
+            length,
+            max_length,
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_bic(input: &str) -> Result<String, Error> {
+    let trimmed = input.trim();
+    let valid_length = trimmed.len() == 8 || trimmed.len() == 11;
+    if !valid_length || !trimmed.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(Error::InvalidBic {
+            input: input.to_string(),
+        });
+    }
+    Ok(trimmed.to_ascii_uppercase())
+}
+
+fn encode_qr_png(data: &[u8], scale: u32) -> Result<Vec<u8>, Error> {
+    let code = encode_byte_mode(data)?;
+    let modules = code.width() as u32;
+    let side = pixel_side(modules, scale)?;
+    let mut image = image::GrayImage::from_pixel(side, side, Luma([255u8]));
+    for (index, color) in code.to_colors().iter().enumerate() {
+        if *color == ModuleColor::Dark {
+            let index = index as u32;
+            let x = (QUIET_ZONE + index % modules) * scale;
+            let y = (QUIET_ZONE + index / modules) * scale;
+            for pixel_y in y..y + scale {
+                for pixel_x in x..x + scale {
+                    image.put_pixel(pixel_x, pixel_y, Luma([0u8]));
+                }
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    PngEncoder::new(&mut bytes)
+        .write_image(image.as_raw(), side, side, ExtendedColorType::L8)
+        .map_err(|error| Error::PngEncoding {
+            message: error.to_string(),
+        })?;
+    Ok(bytes)
+}
+
+fn encode_qr_svg(data: &[u8], scale: u32) -> Result<String, Error> {
+    let code = encode_byte_mode(data)?;
+    let modules = code.width() as u32;
+    let side = pixel_side(modules, scale)?;
+    let total = modules + 2 * QUIET_ZONE;
+    let mut path = String::new();
+    for (index, color) in code.to_colors().iter().enumerate() {
+        if *color == ModuleColor::Dark {
+            let index = index as u32;
+            let x = QUIET_ZONE + index % modules;
+            let y = QUIET_ZONE + index / modules;
+            let _ = write!(path, "M{x} {y}h1v1h-1z");
+        }
+    }
+    Ok(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{side}\" viewBox=\"0 0 {total} {total}\" shape-rendering=\"crispEdges\"><rect width=\"100%\" height=\"100%\" fill=\"#FFFFFF\"/><path d=\"{path}\" fill=\"#000000\"/></svg>"
+    ))
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn encode_byte_mode(data: &[u8]) -> Result<QrCode, Error> {
@@ -365,6 +574,95 @@ pub enum Error {
         /// Encoder message.
         message: String,
     },
+    /// The EPC payload currency is not EUR.
+    UnsupportedEpcCurrency {
+        /// The rejected currency.
+        input: String,
+    },
+    /// A required EPC text field is empty.
+    EpcTextEmpty {
+        /// Human readable field name.
+        name: &'static str,
+    },
+    /// An EPC text field exceeds its specification limit.
+    EpcTextTooLong {
+        /// Human readable field name.
+        name: &'static str,
+        /// Length in characters.
+        length: usize,
+        /// Maximum accepted length.
+        max_length: usize,
+    },
+    /// The EPC amount is outside the range 0.01 to 999999999.99 EUR.
+    EpcAmountOutOfRange {
+        /// The rejected amount in minor units.
+        amount_minor: i64,
+    },
+    /// The BIC is not 8 or 11 alphanumeric characters.
+    InvalidBic {
+        /// The rejected input.
+        input: String,
+    },
+    /// The input contains a control character.
+    ControlCharacter {
+        /// The offending character.
+        character: char,
+    },
+    /// The string does not start with the supported `SPD*1.0` header.
+    InvalidSpdHeader {
+        /// The rejected header.
+        input: String,
+    },
+    /// An SPD field does not have the `NAME:VALUE` form.
+    MalformedSpdField {
+        /// The rejected field.
+        field: String,
+    },
+    /// The SPD string contains an unsupported field.
+    UnknownSpdField {
+        /// The field name.
+        field: String,
+    },
+    /// The SPD string contains the same field more than once.
+    DuplicateSpdField {
+        /// The field name.
+        field: &'static str,
+    },
+    /// The SPD string lacks a required field.
+    MissingSpdField {
+        /// The field name.
+        field: &'static str,
+    },
+    /// A percent escape is incomplete, not hexadecimal, or not valid UTF-8.
+    InvalidPercentEscape {
+        /// The rejected field value.
+        input: String,
+    },
+    /// A file cannot be read or written.
+    Io {
+        /// Operating system message.
+        message: String,
+    },
+    /// CSV data cannot be read.
+    Csv {
+        /// CSV parser message.
+        message: String,
+    },
+    /// The CSV header lacks a required column.
+    MissingCsvColumn {
+        /// The column name.
+        column: &'static str,
+    },
+    /// A value cannot be serialized to JSON.
+    JsonEncoding {
+        /// Encoder message.
+        message: String,
+    },
+    /// A ZIP archive cannot be written.
+    Zip {
+        /// ZIP encoder message.
+        message: String,
+    },
 }
 
 /// Normalizes and validates an IBAN.
@@ -424,6 +722,166 @@ pub fn normalize_currency(input: &str) -> Result<String, Error> {
         });
     }
     Ok(trimmed.to_ascii_uppercase())
+}
+
+/// Parses and validates a complete SPD string, returning the payment it describes.
+///
+/// The input must start with `SPD*1.0` and contain the `ACC`, `AM` and `CC`
+/// fields. The optional fields are `DT`, `MSG`, `X-VS`, `X-KS` and `X-SS`.
+/// Field order is free; malformed, duplicate and unknown fields are rejected.
+/// Percent escapes are decoded and validated; control characters are rejected.
+pub fn parse_spd(input: &str) -> Result<Payment, Error> {
+    let trimmed = input.trim();
+    if let Some(character) = trimmed.chars().find(|character| character.is_control()) {
+        return Err(Error::ControlCharacter { character });
+    }
+    let mut parts = trimmed.split('*');
+    let header = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    if header != "SPD" || version != "1.0" {
+        return Err(Error::InvalidSpdHeader {
+            input: trimmed.to_string(),
+        });
+    }
+    let mut acc: Option<String> = None;
+    let mut am: Option<String> = None;
+    let mut cc: Option<String> = None;
+    let mut dt: Option<String> = None;
+    let mut msg: Option<String> = None;
+    let mut vs: Option<String> = None;
+    let mut ks: Option<String> = None;
+    let mut ss: Option<String> = None;
+    for part in parts {
+        let (field, value) = part
+            .split_once(':')
+            .ok_or_else(|| Error::MalformedSpdField {
+                field: part.to_string(),
+            })?;
+        let decoded = unescape_spd(value)?;
+        match field {
+            "ACC" => set_spd_field(&mut acc, "ACC", decoded)?,
+            "AM" => set_spd_field(&mut am, "AM", decoded)?,
+            "CC" => set_spd_field(&mut cc, "CC", decoded)?,
+            "DT" => set_spd_field(&mut dt, "DT", decoded)?,
+            "MSG" => set_spd_field(&mut msg, "MSG", decoded)?,
+            "X-VS" => set_spd_field(&mut vs, "X-VS", decoded)?,
+            "X-KS" => set_spd_field(&mut ks, "X-KS", decoded)?,
+            "X-SS" => set_spd_field(&mut ss, "X-SS", decoded)?,
+            other => {
+                return Err(Error::UnknownSpdField {
+                    field: other.to_string(),
+                });
+            }
+        }
+    }
+    let iban = normalize_iban(&take_spd_field(acc, "ACC")?)?;
+    let amount_minor = parse_amount(&take_spd_field(am, "AM")?)?;
+    let currency = normalize_currency(&take_spd_field(cc, "CC")?)?;
+    let due_date = match dt {
+        Some(value) => Some(parse_spd_date(&value)?),
+        None => None,
+    };
+    let message = msg.filter(|value| !value.is_empty());
+    if let Some(message) = &message {
+        let length = message.chars().count();
+        if length > MAX_MESSAGE_CHARS {
+            return Err(Error::MessageTooLong {
+                length,
+                max_length: MAX_MESSAGE_CHARS,
+            });
+        }
+    }
+    let variable_symbol = match vs {
+        Some(value) => Some(normalize_symbol("variable symbol", &value, 10)?),
+        None => None,
+    };
+    let constant_symbol = match ks {
+        Some(value) => Some(normalize_symbol("constant symbol", &value, 4)?),
+        None => None,
+    };
+    let specific_symbol = match ss {
+        Some(value) => Some(normalize_symbol("specific symbol", &value, 4)?),
+        None => None,
+    };
+    Ok(Payment {
+        iban,
+        amount_minor,
+        currency,
+        variable_symbol,
+        constant_symbol,
+        specific_symbol,
+        message,
+        due_date,
+    })
+}
+
+fn set_spd_field(
+    slot: &mut Option<String>,
+    name: &'static str,
+    value: String,
+) -> Result<(), Error> {
+    if slot.replace(value).is_some() {
+        return Err(Error::DuplicateSpdField { field: name });
+    }
+    Ok(())
+}
+
+fn take_spd_field(slot: Option<String>, name: &'static str) -> Result<String, Error> {
+    slot.ok_or(Error::MissingSpdField { field: name })
+}
+
+fn parse_spd_date(input: &str) -> Result<String, Error> {
+    let bytes = input.as_bytes();
+    if bytes.len() != 8 || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(Error::InvalidDueDate {
+            input: input.to_string(),
+        });
+    }
+    let normalized = format!("{}-{}-{}", &input[0..4], &input[4..6], &input[6..8]);
+    format_due_date(&normalized)?;
+    Ok(normalized)
+}
+
+fn unescape_spd(input: &str) -> Result<String, Error> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(Error::InvalidPercentEscape {
+                    input: input.to_string(),
+                });
+            }
+            let high = hex_value(bytes[index + 1]).ok_or_else(|| Error::InvalidPercentEscape {
+                input: input.to_string(),
+            })?;
+            let low = hex_value(bytes[index + 2]).ok_or_else(|| Error::InvalidPercentEscape {
+                input: input.to_string(),
+            })?;
+            output.push(high * 16 + low);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(output).map_err(|_| Error::InvalidPercentEscape {
+        input: input.to_string(),
+    })?;
+    if let Some(character) = decoded.chars().find(|character| character.is_control()) {
+        return Err(Error::ControlCharacter { character });
+    }
+    Ok(decoded)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Formats minor units as an SPD amount with a dot and exactly two fraction digits.
@@ -604,6 +1062,55 @@ impl fmt::Display for Error {
             ),
             Error::QrEncoding { message } => write!(formatter, "QR encoding failed: {message}"),
             Error::PngEncoding { message } => write!(formatter, "PNG encoding failed: {message}"),
+            Error::UnsupportedEpcCurrency { input } => {
+                write!(formatter, "EPC supports only EUR, got '{input}'")
+            }
+            Error::EpcTextEmpty { name } => write!(formatter, "EPC {name} is required"),
+            Error::EpcTextTooLong {
+                name,
+                length,
+                max_length,
+            } => write!(
+                formatter,
+                "EPC {name} has {length} characters, maximum is {max_length}"
+            ),
+            Error::EpcAmountOutOfRange { amount_minor } => write!(
+                formatter,
+                "EPC amount {amount_minor} minor units is outside 0.01 to 999999999.99 EUR"
+            ),
+            Error::InvalidBic { input } => write!(
+                formatter,
+                "invalid BIC '{input}': expected 8 or 11 alphanumeric characters"
+            ),
+            Error::ControlCharacter { character } => {
+                write!(formatter, "control character {character:?} is not allowed")
+            }
+            Error::InvalidSpdHeader { input } => {
+                write!(formatter, "invalid SPD header '{input}': expected SPD*1.0")
+            }
+            Error::MalformedSpdField { field } => write!(
+                formatter,
+                "malformed SPD field '{field}': expected NAME:VALUE"
+            ),
+            Error::UnknownSpdField { field } => write!(formatter, "unknown SPD field '{field}'"),
+            Error::DuplicateSpdField { field } => {
+                write!(formatter, "duplicate SPD field '{field}'")
+            }
+            Error::MissingSpdField { field } => {
+                write!(formatter, "missing required SPD field '{field}'")
+            }
+            Error::InvalidPercentEscape { input } => {
+                write!(formatter, "invalid percent escape in '{input}'")
+            }
+            Error::Io { message } => write!(formatter, "I/O error: {message}"),
+            Error::Csv { message } => write!(formatter, "CSV error: {message}"),
+            Error::MissingCsvColumn { column } => {
+                write!(formatter, "CSV is missing the required column '{column}'")
+            }
+            Error::JsonEncoding { message } => {
+                write!(formatter, "JSON encoding failed: {message}")
+            }
+            Error::Zip { message } => write!(formatter, "ZIP error: {message}"),
         }
     }
 }
