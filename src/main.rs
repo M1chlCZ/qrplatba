@@ -100,7 +100,7 @@ struct Cli {
     scale: u32,
 
     /// Print the payment payload string instead of a QR image.
-    #[arg(long, alias = "payload-only")]
+    #[arg(long)]
     spd_only: bool,
 
     /// Validate an SPD string and print a normalized summary.

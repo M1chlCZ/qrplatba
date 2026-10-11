@@ -197,8 +197,8 @@ impl Payment {
 
     /// Returns a normalized human readable summary of the payment fields.
     ///
-    /// Each field appears on its own line. Empty optional fields are omitted.
-    /// The amount is printed in major units with two decimal places.
+    /// Each field appears on its own line. The summary omits empty optional
+    /// fields and prints the amount in major units with two decimal places.
     pub fn summary(&self) -> Result<String, Error> {
         let amount = format_amount(self.amount_minor)?;
         let currency = normalize_currency(&self.currency)?;
@@ -229,9 +229,10 @@ impl Payment {
 
 /// Builder for an EPC069-12 (SEPA) credit transfer payload.
 ///
-/// The payload is Euro only and uses the UTF-8 character set. The beneficiary
-/// name is required. The BIC and the unstructured information line are
-/// optional. The payment message is used as the unstructured remittance line.
+/// The payload is Euro only and uses the UTF-8 character set. The builder
+/// requires the beneficiary name. The BIC and the unstructured information
+/// line are optional. The builder writes the payment message on the
+/// unstructured remittance line.
 ///
 /// # Example
 ///
@@ -278,7 +279,7 @@ impl<'a> EpcPayment<'a> {
         self
     }
 
-    /// Builds the EPC069-12 payload with lines separated by `\n`.
+    /// Builds the EPC069-12 payload with `\n` between the lines.
     ///
     /// The payload rejects currencies other than EUR, amounts outside the range
     /// 0.01 to 999999999.99, text over the specification limits, and control
@@ -728,8 +729,9 @@ pub fn normalize_currency(input: &str) -> Result<String, Error> {
 ///
 /// The input must start with `SPD*1.0` and contain the `ACC`, `AM` and `CC`
 /// fields. The optional fields are `DT`, `MSG`, `X-VS`, `X-KS` and `X-SS`.
-/// Field order is free; malformed, duplicate and unknown fields are rejected.
-/// Percent escapes are decoded and validated; control characters are rejected.
+/// Field order is free. The parser rejects malformed, duplicate and unknown
+/// fields. It decodes and validates percent escapes and rejects control
+/// characters.
 pub fn parse_spd(input: &str) -> Result<Payment, Error> {
     let trimmed = input.trim();
     if let Some(character) = trimmed.chars().find(|character| character.is_control()) {

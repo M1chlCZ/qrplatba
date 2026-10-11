@@ -1,8 +1,8 @@
 //! Batch generation of payment QR codes from CSV data.
 //!
 //! The module reads a CSV table, generates one QR image per row, and writes an
-//! `index.json` report into the output directory. A bad row is recorded in the
-//! report and does not stop the remaining rows. [`zip_batch`] packages the
+//! `index.json` report into the output directory. The report records a bad row
+//! and the batch continues with the remaining rows. [`zip_batch`] packages the
 //! generated files and the report into a ZIP archive.
 
 use std::fs;
@@ -76,8 +76,8 @@ struct Columns {
 ///
 /// The CSV requires a header with the `iban` and `amount` columns. The columns
 /// `currency`, `vs`, `ks`, `ss`, `message`, `due` and `name` are optional; the
-/// `name` column is required for [`PaymentScheme::Epc`]. A missing currency
-/// defaults to `CZK` for SPD and `EUR` for EPC.
+/// [`PaymentScheme::Epc`] scheme requires the `name` column. A missing
+/// currency defaults to `CZK` for SPD and `EUR` for EPC.
 ///
 /// The function creates the output directory, writes `index.json`, and returns
 /// one [`BatchEntry`] per data row. Failed rows carry an error and no file.
@@ -140,7 +140,7 @@ pub fn process_batch(
 
 /// Writes `index.json` and every generated batch file into a ZIP archive.
 ///
-/// Files are stored without compression, so the archive is deterministic.
+/// The archive stores files without compression, so the output is deterministic.
 pub fn zip_batch(zip_path: &Path, output_dir: &Path, entries: &[BatchEntry]) -> Result<(), Error> {
     let file = fs::File::create(zip_path).map_err(io_error)?;
     let mut writer = zip::ZipWriter::new(file);
