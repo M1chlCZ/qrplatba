@@ -2,9 +2,9 @@
 //!
 //! The crate builds deterministic SPAYD ("Short Payment Descriptor") strings for
 //! Czech QR payments and renders them as PNG or SVG QR codes. It also builds
-//! EPC069-12 (SEPA) payloads, validates complete SPD strings, and generates one
-//! QR image per CSV row in batch mode. All processing happens offline; the crate
-//! performs no network access.
+//! EPC069-12 (SEPA) payloads, validates complete SPD strings, resolves Czech
+//! bank codes, and generates one QR image per CSV row in batch mode. All
+//! processing happens offline; the crate performs no network access.
 //!
 //! # Example
 //!
@@ -21,6 +21,7 @@
 //! );
 //! ```
 
+pub mod bank;
 pub mod batch;
 
 use std::fmt;
@@ -199,13 +200,19 @@ impl Payment {
     ///
     /// Each field appears on its own line. The summary omits empty optional
     /// fields and prints the amount in major units with two decimal places.
+    /// For a Czech IBAN it adds the bank code from positions 5 to 8 and the
+    /// bank name when the offline table knows the code; unknown codes print
+    /// `unknown`.
     pub fn summary(&self) -> Result<String, Error> {
+        let iban = normalize_iban(&self.iban)?;
         let amount = format_amount(self.amount_minor)?;
         let currency = normalize_currency(&self.currency)?;
-        let mut lines = vec![
-            format!("IBAN: {}", normalize_iban(&self.iban)?),
-            format!("Amount: {amount} {currency}"),
-        ];
+        let mut lines = vec![format!("IBAN: {iban}")];
+        if let Some(bank) = bank::czech_bank(&iban) {
+            lines.push(format!("Bank code: {}", bank.code));
+            lines.push(format!("Bank: {}", bank.name.unwrap_or("unknown")));
+        }
+        lines.push(format!("Amount: {amount} {currency}"));
         if let Some(due_date) = non_empty(self.due_date.as_deref()) {
             format_due_date(due_date)?;
             lines.push(format!("Due date: {due_date}"));

@@ -177,6 +177,6 @@ fn summary_is_normalized() {
     let payment = parse_spd(VALID).unwrap();
     assert_eq!(
         payment.summary().unwrap(),
-        "IBAN: CZ6508000000192000145399\nAmount: 1250.00 CZK\nDue date: 2026-10-07\nMessage: Faktura 2026-001\nVariable symbol: 1234567890\nConstant symbol: 0308\nSpecific symbol: 12"
+        "IBAN: CZ6508000000192000145399\nBank code: 0800\nBank: Česká spořitelna\nAmount: 1250.00 CZK\nDue date: 2026-10-07\nMessage: Faktura 2026-001\nVariable symbol: 1234567890\nConstant symbol: 0308\nSpecific symbol: 12"
     );
 }

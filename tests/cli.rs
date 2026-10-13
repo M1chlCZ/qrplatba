@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const CZ_IBAN: &str = "CZ6508000000192000145399";
+const CZ_UNKNOWN_BANK_IBAN: &str = "CZ7799990000192000145399";
+const SK_IBAN: &str = "SK3112000000198742637541";
 
 fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_qrplatba"))
@@ -183,6 +185,86 @@ fn validate_json_exits_zero_with_parsed_fields() {
     assert_eq!(value["currency"], "CZK");
     assert_eq!(value["due_date"], "2026-10-07");
     assert_eq!(value["variable_symbol"], "123");
+}
+
+#[test]
+fn validate_known_bank_code_prints_code_and_name() {
+    let output = command()
+        .args([
+            "--validate",
+            "SPD*1.0*ACC:CZ6508000000192000145399*AM:1250.00*CC:CZK",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "IBAN: CZ6508000000192000145399\nBank code: 0800\nBank: Česká spořitelna\nAmount: 1250.00 CZK\n"
+    );
+}
+
+#[test]
+fn validate_unknown_bank_code_prints_unknown_and_stays_valid() {
+    let output = command()
+        .arg("--validate")
+        .arg(format!("SPD*1.0*ACC:{CZ_UNKNOWN_BANK_IBAN}*AM:1.00*CC:CZK"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("IBAN: {CZ_UNKNOWN_BANK_IBAN}\nBank code: 9999\nBank: unknown\nAmount: 1.00 CZK\n")
+    );
+}
+
+#[test]
+fn validate_non_czech_iban_prints_no_bank_lines() {
+    let output = command()
+        .arg("--validate")
+        .arg(format!("SPD*1.0*ACC:{SK_IBAN}*AM:1.00*CC:CZK"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("IBAN: {SK_IBAN}\nAmount: 1.00 CZK\n")
+    );
+}
+
+#[test]
+fn validate_json_includes_the_resolved_bank() {
+    let output = command()
+        .args(["--validate", VALID_SPD, "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["bank_code"], "0800");
+    assert_eq!(value["bank_name"], "Česká spořitelna");
+}
+
+#[test]
+fn validate_json_reports_unknown_banks_and_other_countries_as_null() {
+    let unknown = command()
+        .arg("--validate")
+        .arg(format!("SPD*1.0*ACC:{CZ_UNKNOWN_BANK_IBAN}*AM:1.00*CC:CZK"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(unknown.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&unknown.stdout).unwrap();
+    assert_eq!(value["bank_code"], "9999");
+    assert_eq!(value["bank_name"], serde_json::Value::Null);
+    let foreign = command()
+        .arg("--validate")
+        .arg(format!("SPD*1.0*ACC:{SK_IBAN}*AM:1.00*CC:CZK"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(foreign.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&foreign.stdout).unwrap();
+    assert_eq!(value["bank_code"], serde_json::Value::Null);
+    assert_eq!(value["bank_name"], serde_json::Value::Null);
 }
 
 #[test]

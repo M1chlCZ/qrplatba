@@ -3,8 +3,8 @@
 `qrplatba` makes Czech QR payments. It builds the SPAYD (SPD) string for the
 payment, and it renders the string as a PNG or SVG QR code. Banks and payment
 applications in Czechia read this format. It also builds EPC069-12 (SEPA)
-payloads for Euro payments, validates complete SPD strings, and generates one
-QR image per CSV row in batch mode.
+payloads for Euro payments, validates complete SPD strings with a Czech bank
+code lookup, and generates one QR image per CSV row in batch mode.
 
 The command line tool and the library work offline. They make no network
 access, and the output is deterministic.
@@ -137,15 +137,38 @@ The first command prints:
 
 ```text
 IBAN: CZ6508000000192000145399
+Bank code: 0800
+Bank: Česká spořitelna
 Amount: 1250.00 CZK
 Variable symbol: 2026001
 ```
+
+For a Czech IBAN the tool reads the four-digit bank code from positions 5 to 8
+and resolves it through an offline table of established codes:
+
+| Bank code | Bank |
+| --- | --- |
+| `0100` | Komerční banka |
+| `0300` | ČSOB |
+| `0600` | MONETA Money Bank |
+| `0710` | Česká národní banka |
+| `0800` | Česká spořitelna |
+| `2010` | Fio banka |
+| `2250` | Banka CREDITAS |
+| `3030` | Air Bank |
+| `5500` | Raiffeisenbank |
+| `6210` | mBank |
+
+A code outside the table prints `Bank: unknown`, and the string stays valid.
+An IBAN from another country prints no bank lines.
 
 The command exits with code `0` when the string is valid and `2` when it is
 not. It validates the IBAN checksum, the amount format, the symbols, the date,
 the message length, and all percent escapes. Duplicate and unknown fields are
 rejected. The `--json` output contains the parsed payment with the amount in
-minor units. Field order is free; the summary uses a stable order.
+minor units, plus the `bank_code` and `bank_name` fields. Both fields are
+`null` for a non-Czech IBAN; `bank_name` is also `null` when the code is
+unknown. Field order is free; the summary uses a stable order.
 
 ## Batch mode
 
@@ -210,6 +233,19 @@ assert_eq!(parsed, payment);
 Amounts use minor units. For example, `125_000` means `1250.00`. The functions
 `parse_amount` and `format_amount` convert between a string and minor units
 without floating point arithmetic.
+
+`qrplatba::bank::czech_bank` resolves the four-digit bank code of a Czech
+IBAN, and `qrplatba::bank::bank_name` resolves the code on its own. Unknown
+codes resolve to `None` and never fail validation:
+
+```rust
+use qrplatba::bank::{bank_name, czech_bank};
+
+let bank = czech_bank("CZ6508000000192000145399").unwrap();
+assert_eq!(bank.code, "0800");
+assert_eq!(bank.name, Some("Česká spořitelna"));
+assert_eq!(bank_name("9999"), None);
+```
 
 The QR codes use error correction level M. The quiet zone is 4 modules. The PNG
 uses one bit per pixel, and the SVG uses a `crispEdges` path.

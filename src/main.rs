@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use qrplatba::batch::{PaymentScheme, QrFormat, process_batch, zip_batch};
-use qrplatba::{DEFAULT_SCALE, EpcPayment, Payment, parse_amount, parse_spd};
+use qrplatba::{DEFAULT_SCALE, EpcPayment, Payment, bank, parse_amount, parse_spd};
+use serde::Serialize;
 
 /// Output format for the generated QR code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -41,6 +42,17 @@ impl From<Scheme> for PaymentScheme {
             Scheme::Epc => PaymentScheme::Epc,
         }
     }
+}
+
+/// JSON report for a validated SPD string with the resolved Czech bank fields.
+#[derive(Serialize)]
+struct ValidationReport<'a> {
+    #[serde(flatten)]
+    payment: &'a Payment,
+    /// Four-digit Czech bank code, or `null` when the IBAN is not Czech.
+    bank_code: Option<&'a str>,
+    /// Bank name, or `null` when the code is unknown or the IBAN is not Czech.
+    bank_name: Option<&'a str>,
 }
 
 /// Generate Czech QR payment (SPAYD/SPD) strings and QR images.
@@ -140,8 +152,14 @@ fn run(cli: Cli) -> Result<()> {
 
 fn validate(input: &str, json: bool) -> Result<()> {
     let payment = parse_spd(input)?;
+    let bank = bank::czech_bank(&payment.iban);
     if json {
-        let text = serde_json::to_string_pretty(&payment)
+        let report = ValidationReport {
+            payment: &payment,
+            bank_code: bank.as_ref().map(|bank| bank.code.as_str()),
+            bank_name: bank.as_ref().and_then(|bank| bank.name),
+        };
+        let text = serde_json::to_string_pretty(&report)
             .context("cannot serialize the validation result")?;
         println!("{text}");
     } else {
